@@ -47,6 +47,9 @@ const TERMINAL = new Set([
 /** sessionID → 本回合已累积的心情表情。 */
 const buckets = new Map<string, string[]>()
 
+/** sessionID → 该 session 的结算是否正在进行。防止同一回合重复写消息。 */
+const settling = new Set<string>()
+
 /** 只取用得上的两个字段，其余不关心。 */
 interface MoodEvent {
   type?: string
@@ -77,17 +80,45 @@ export default Plugin.define({
      *
      * `resume: false` 是关键：消息照常落库并显示，但不会把会话拉起来，
      * 因此不触发任何 LLM 调用、不花 token（已实测确认）。
+     *
+     * `description` 也必须给，否则消息落库了但桌面端不显示，见 settle() 内注释。
      * ----------------------------------------------------------------- */
     const controller = new AbortController()
 
     const settle = async (sessionID: string) => {
-      const bucket = buckets.get(sessionID) ?? []
-      buckets.delete(sessionID)
-      const text = "" + (bucket.length > 0 ? bucket.join("") : CALM_MOOD)
-      // 写失败（session 已删等）不该影响插件本身，静默吞掉。
+      // 同一 session 的结算并发保护：回合结束事件可能连着来两次，
+      // 而 ctx.session.synthetic 是异步的，await 之前另一个 settle 已经跑掉了。
+      // 没有这个闸门就会出现「一条 desc 为空、一条 desc 非空」的重复消息。
+      if (settling.has(sessionID)) return
+      settling.add(sessionID)
+
       try {
-        await ctx.session.synthetic({ sessionID, text, resume: false })
-      } catch {}
+        const bucket = buckets.get(sessionID) ?? []
+        buckets.delete(sessionID)
+        const text = "🔹" + (bucket.length > 0 ? bucket.join("") : CALM_MOOD)
+
+        // 写失败（session 已删等）不该影响插件本身，静默吞掉。
+        //
+        // description 必须给非空值，否则桌面端时间线会把消息丢掉。桌面端的过滤函数是：
+        //   uf(e) = e.type===`user` || `assistant` || `shell` || `idle` ? false
+        //          : e.type!==`synthetic` || !!e.description?.trim() || _e(e)
+        // 对 synthetic 而言 description 为空 → uf 返回 false → 在
+        // constructSessionMessageRows 里落到 `if(e.type!==`assistant`)return` 被整条丢弃，
+        // 消息落库了但界面上看不见。
+        //
+        // 而 Notice 的 label 取 `e.description ?? e.text`，优先用 description。
+        // 所以这里给 description 塞同一个字符串：既过渲染门槛，显示出来的也是这串 emoji。
+        try {
+          await ctx.session.synthetic({
+            sessionID,
+            text,
+            description: text || "mood",
+            resume: false,
+          })
+        } catch {}
+      } finally {
+        settling.delete(sessionID)
+      }
     }
 
     void (async () => {
@@ -106,7 +137,9 @@ export default Plugin.define({
             else buckets.set(sessionID, [mood])
           }
 
-          if (TERMINAL.has(type)) await settle(sessionID)
+          if (TERMINAL.has(type)) {
+            await settle(sessionID)
+          }
         }
       } catch {}
     })()
@@ -114,6 +147,7 @@ export default Plugin.define({
     return () => {
       controller.abort()
       buckets.clear()
+      settling.clear()
     }
   },
 })
