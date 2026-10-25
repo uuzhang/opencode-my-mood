@@ -10,6 +10,15 @@ const AI_MOOD = true
 /** 功能二：插件侧根据会话事件计算心情，以若干 emoji 追加在回复之后。 */
 const PLUGIN_MOOD = true
 
+/** 调试：把每次请求前剔除掉的条数打到 server log（`MOOD_DEBUG=1` + `--print-logs`）。 */
+const DEBUG = (() => {
+  try {
+    return process.env.MOOD_DEBUG === "1"
+  } catch {
+    return false
+  }
+})()
+
 // AI 心情指令。故意不限定表情集合：把 28 个 emoji 列进指令本身就要几十个 token，
 // 而这里没有识别/映射需求，让模型自己选更省。
 // 代价是模型可能选出多码位 emoji（如 👨‍💻），token 略高、个别终端渲染不出。
@@ -36,6 +45,54 @@ const EVENT_MOOD: Record<string, string> = {
 
 /** 一个回合顺顺利利时的心情。 */
 const CALM_MOOD = "😌"
+
+/**
+ * 判断一条模型消息是不是功能二写出的心情行。
+ *
+ * 心情行落库时是 synthetic 消息，但 opencode 组装请求时（FW 的 `case"synthetic"`）
+ * 会把它当成普通 user 消息塞进上下文：`dH.make({role:"user",content:H.text})`。
+ * 实测在 context hook 里看到的是 `role: "user"` + content 为 part 数组
+ * （`[{type:"text",text:"🔹😌"}]`），不是裸字符串，所以两种形状都要认。
+ *
+ * 按「整条消息就是 🔹 加一串 emoji」来认，而不是「含有 🔹」——
+ * 用户自己打的带 🔹 的正文不会被误删。
+ *
+ * 用文本形状而不是记 id：重启后进程内的 id 集合就没了，但历史里的旧心情行还在。
+ */
+const MOOD_TEXT = /^🔹(?:[\p{Extended_Pictographic}\uFE0F\u200D])+$/u
+
+const isMoodMessage = (message: any) => {
+  if (!message || message.role !== "user") return false
+
+  const content = message.content
+  if (typeof content === "string") return MOOD_TEXT.test(content)
+
+  // user 消息正常是 part 数组（实测心情行在这里也是数组），字符串分支只是兜底。
+  if (!Array.isArray(content)) return false
+  const texts = content.map((part: any) => (part?.type === "text" ? part.text : undefined))
+  if (texts.some((text) => typeof text !== "string")) return false
+  return texts.length > 0 && MOOD_TEXT.test(texts.join(""))
+}
+
+/**
+ * 把心情行从待发消息里剔掉。
+ *
+ * 这是功能二真正的「不花 token」保证：`resume: false` 只保证不唤醒模型，
+ * 但消息一旦落库，后续每一轮都会被当成 user 消息发给服务器。
+ * context / compaction hook 拿到的 `event.messages` 就是最终要发出去的模型消息数组
+ * （SessionModelRequest.prepare 里 `T = yield*P({... messages ...})` 之后直接用 `T.messages`），
+ * 原地 splice 即可。内置 Plan 模式插件也是这么改 messages 的。
+ */
+const stripMood = (messages: any) => {
+  if (!Array.isArray(messages)) return
+  let removed = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!isMoodMessage(messages[i])) continue
+    messages.splice(i, 1)
+    removed++
+  }
+  if (DEBUG && removed > 0) console.log(`[mood] stripped ${removed} mood message(s)`)
+}
 
 /** 回合结束的事件；命中就结算这一轮累积的心情。 */
 const TERMINAL = new Set([
@@ -71,6 +128,13 @@ export default Plugin.define({
         event.system.push({ type: "text", text: INSTRUCTION })
       })
     }
+
+    /* ---- 功能二（一半）：把历史里的心情行从请求里剔掉 -------------- *
+     * 与 PLUGIN_MOOD 开关无关：即使关掉功能二，历史里已经落库的 🔹 行
+     * 也不该继续喂给模型。
+     * ----------------------------------------------------------------- */
+    await ctx.session.hook("context", (event) => stripMood(event.messages))
+    await ctx.session.hook("compaction", (event) => stripMood(event.messages))
 
     if (!PLUGIN_MOOD) return
 

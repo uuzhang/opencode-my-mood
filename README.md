@@ -54,7 +54,39 @@ const PLUGIN_MOOD = true
 |---|---|
 | 注入的指令（常驻 system prompt，命中 prompt cache） | ~10 token |
 | 每次回复新增输出 | 1 个表情 ≈ 1–2 token |
-| 功能二的 synthetic 消息 | **0 token**（`resume: false`，不触发 LLM） |
+| 功能二的 synthetic 消息 | **0 token**（请求前被剔掉，见下节） |
+
+### 为什么 synthetic 消息是 0 token
+
+`synthetic` 消息落库时是独立类型，但 opencode 组装请求时会把**所有历史条目**统一转成模型消息
+（`PU` → `FW`），其中 `case "synthetic"` 是：
+
+```js
+return [dH.make({ id: H.id, role: "user", content: H.text })]
+```
+
+也就是被当成一条**普通 user 消息**塞进上下文——`resume: false` 只阻止「唤醒模型」，
+不阻止它进入后续每一轮的请求。所以不加处理的话，🔹 行会和下一条用户消息一起发到服务器。
+
+本插件在 `context` 和 `compaction` 两个 hook 里把它剔掉：
+
+```ts
+await ctx.session.hook("context", (event) => stripMood(event.messages))
+await ctx.session.hook("compaction", (event) => stripMood(event.messages))
+```
+
+`context` hook 收到的 `event.messages` 就是最终要发出去的模型消息数组
+（`SessionModelRequest.prepare` 里 `T = yield*P({ ... messages ... })` 之后直接用 `T.messages`），
+原地 `splice` 即可生效。内置的 Plan 模式插件也是这么改 `messages` 的。
+压缩走的是独立的 `compaction` hook，所以两个都要挂。
+
+识别方式是**整条匹配** `^🔹<emoji>+$`（`MOOD_TEXT`），不是「含有 🔹」——
+用户自己打的带 🔹 的正文不会被误删。用文本形状而不是记 id，是因为进程重启后 id 集合就没了，
+但历史里的旧心情行还在；且 `FW` 的 synthetic 分支会丢弃 metadata，没法用 metadata 打标记。
+
+调试：`MOOD_DEBUG=1` + `opencode run --standalone --print-logs` 时会打印
+`[mood] stripped N mood message(s)`。注意普通 `--print-logs` 下这个 `console.log` 不一定可见，
+需要确凿证据时以「问模型历史里有没有 🔹 开头的消息」为准（实测回答「没有」）。
 
 ## 已验证事实
 
@@ -78,4 +110,6 @@ const PLUGIN_MOOD = true
 - **靠 prompt 约束，遵从度是概率性的**。实测同一个插件在不同模型上表现不同：qoder/auto 稳定输出，另一些模型会漏。这是功能一的固有软肋，插件无法强制。功能二不受影响，它是事件驱动的。
 - 功能二的 `🔹` 行是**独立的 synthetic 消息**，不是追加进 AI 那条回复气泡里。OpenCode 没有编辑已生成助手消息的 API（message 路由只有 GET），这一点绕不过去。
 - 功能二只统计本插件已订阅的事件，跨进程/重启后计数清零。
+- 剔除只挂在 `context` 和 `compaction` 两个 hook 上（对话与压缩）。`title` / `generate`
+  这类辅助请求不挂，理论上仍会带上历史里的 🔹 行——它们不进对话上下文，影响可忽略。
 - 本插件不做识别、不做窗口联动。如果以后要接窗口，从 `session.text.ended` 拿最终文本、匹配末尾表情即可。
